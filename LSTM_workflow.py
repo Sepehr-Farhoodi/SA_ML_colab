@@ -43,6 +43,7 @@ LSTM_CONFIG = {
     'output_size': 1,          # Number of output features
     'sequence_length': 365,    # Length of input sequences
     'num_samples': 512,        # Number of training samples to generate
+    'num_samples_test': 100,    # Number of test samples to generate
     'batch_size': 64,          # Training batch size
     'learning_rate': 0.001,    # Learning rate
     'num_epochs': 50,         # Number of training epochs
@@ -60,7 +61,7 @@ FILE_PATHS = {
 }
 
 # ============================================================================
-# DATASET CLASS DEFINITION
+# CLASS DEFINITION
 # ============================================================================
 
 class HydroDataset(Dataset):
@@ -217,12 +218,12 @@ def extract_flow_data(dataset_type):
     # Calculate normalized values for variables
     mean = {}
     std = {}
-    variables_to_normalize = ['OBS_RUN', 'MOD_RUN']
+    variables_to_normalize = ['OBS_RUN']
     
     for var in variables_to_normalize:
-        mean[var] = filtered_data[var].mean()
+        mean[var] = filtered_data[var].mean() 
         std[var] = filtered_data[var].std()
-        filtered_data[var] = (filtered_data[var] - mean[var]) / std[var]  # Fixed: use mean[var] and std[var]
+        filtered_data[var] = (filtered_data[var] - mean[var]) / std[var] 
     
     # Print some statistics
     print(f"\nData summary for {dataset_type} period:")
@@ -430,6 +431,8 @@ def LSTM_training(merged_data, flow_mean, flow_std):
     optimizer = optim.Adam(model.parameters(), lr=0.001)
 
     # Train the model
+    best_nse = -float('inf')
+    best_model_state = None
 
     # Epochs to visualize
     epoch_preds = {}
@@ -470,6 +473,19 @@ def LSTM_training(merged_data, flow_mean, flow_std):
                 # Store predictions
                 epoch_preds[epoch] = (y_pred_denorm, y_obs_denorm)
 
+                # Save best model
+                if nse_value > best_nse:
+                    best_nse = nse_value
+                    best_model_state = model.state_dict().copy()
+
+    # Save the best model
+    torch.save(best_model_state, FILE_PATHS['project_root'] / "best_model.pth")
+    print(f"Best model saved with NSE: {best_nse:.4f}")
+
+    # Create a fresh model with best parameters
+    best_model = LSTMModel(input_size=5, hidden_size=20, num_layers=2, output_size=1)
+    best_model.load_state_dict(best_model_state)
+
     # Plot the NSE score over epochs
 
     epochs = sorted(nse_per_epoch.keys())
@@ -483,6 +499,142 @@ def LSTM_training(merged_data, flow_mean, flow_std):
     plt.grid(True)
     plt.tight_layout()
     plt.show()
+
+    return best_model # Returns the best model
+
+def LSTM_testing(merged_data, flow_mean, flow_std, trained_model=None):
+
+    seq_len = LSTM_CONFIG['sequence_length']
+    num_samples_test = LSTM_CONFIG['num_samples_test']
+
+    # Load the trained model
+    if trained_model is None:
+        # Fallback: load from disk if no model provided
+        model = LSTMModel(input_size=5, hidden_size=20, num_layers=2, output_size=1)
+        model.load_state_dict(torch.load('best_model.pth'))
+        print("Loaded trained model from disk")
+    else:
+        # Use the provided trained model
+        model = trained_model
+        print("Using provided trained model")
+    
+    model.eval()  # Set to evaluation mode
+
+    # --- LOAD DATA ---
+    test_df = merged_data
+
+    # --- CREATE SAMPLES ---
+    X_list = []
+    y_obs_list = []
+    y_mod_list = []
+
+    # Set random seed for reproducibility
+    np.random.seed(42)
+
+    # Calculate the maximum possible start index
+    max_start_idx = len(test_df) - seq_len - 1
+
+    print(f"Creating {num_samples_test} random samples...")
+    print(f"Data length: {len(test_df)}")
+    print(f"Sequence length: {seq_len}")
+    print(f"Max possible start index: {max_start_idx}")
+
+
+    for i in range(num_samples_test):
+        start_idx = np.random.randint(0, max_start_idx + 1)
+        end_idx = start_idx + seq_len
+        y_idx = end_idx  # The day after the last X day
+
+        # Make sure we don't go out of bounds
+        if y_idx >= len(test_df):
+            break
+
+        # X: shape (365, 5)
+        X_seq = test_df.iloc[start_idx:end_idx][['prcp(mm/day)', 'srad(W/m2)', 'tmax(C)', 'tmin(C)', 'vp(Pa)']].values
+        # y: shape (1,)
+        y_obs = test_df.iloc[y_idx]['obs_flow']
+        y_mod = test_df.iloc[y_idx]['mod_flow']
+
+        X_list.append(X_seq)
+        y_obs_list.append([y_obs])
+        y_mod_list.append([y_mod])
+
+    X_test = np.stack(X_list)  # shape (num_samples, 365, 5)
+    y_obs = np.stack(y_obs_list)  # shape (num_samples, 1)
+    y_mod = np.stack(y_mod_list)  # shape (num_samples, 1)
+    y_mod = y_mod.squeeze() # shape (num_samples,) squeeze to 1D array (so that it can be used correctly in the nse function)
+
+    print("X_test shape:", X_test.shape)
+    print("y_obs shape:", y_obs.shape)
+    print("y_mod shape:", y_mod.shape)
+
+    # Create test dataset and dataloader
+    test_dataset = HydroDataset(X_test, y_obs)
+    test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)  # No shuffling for testing
+
+    # Make predictions with the trained model
+    model.eval()
+    with torch.no_grad():
+        all_preds = []
+        all_obs = []
+        
+        for X_batch, y_batch in test_loader:
+            y_pred = model(X_batch)
+            all_preds.append(y_pred.detach().cpu())
+            all_obs.append(y_batch.detach().cpu())
+
+        # Concatenate all batches
+        y_pred_full = torch.cat(all_preds).squeeze().numpy()
+        y_obs_full = torch.cat(all_obs).squeeze().numpy()
+
+        # Denormalize predictions
+        y_pred_denorm = y_pred_full * flow_std + flow_mean
+        y_obs_denorm = y_obs_full * flow_std + flow_mean
+
+        # Calculate NSE for test set (LSTM model)
+        nse_test_pred = nse(y_pred_denorm, y_obs_denorm)
+        #print(f"Test NSE: {nse_test_pred:.4f}")
+
+        # Calculate NSE for test set (physical model)
+        nse_test_mod = nse(y_mod, y_obs_denorm)
+        #print(f"Test NSE: {nse_test_mod:.4f}")
+
+        # Plot results
+        plt.figure(figsize=(15, 5))
+        
+        plt.subplot(2, 2, 1)
+        plt.scatter(y_obs_denorm, y_pred_denorm, alpha=0.6)
+        plt.plot([y_obs_denorm.min(), y_obs_denorm.max()], [y_obs_denorm.min(), y_obs_denorm.max()], 'r--')
+        plt.xlabel('Observed Flow')
+        plt.ylabel('Predicted Flow')
+        plt.title(f'LSTM Predictions vs Observed (NSE: {nse_test_pred:.4f})')
+
+        plt.subplot(2, 2, 2)
+        plt.scatter(y_obs_denorm, y_mod, alpha=0.6)
+        plt.plot([y_obs_denorm.min(), y_obs_denorm.max()], [y_obs_denorm.min(), y_obs_denorm.max()], 'r--')
+        plt.xlabel('Observed Flow')
+        plt.ylabel('Modeled Flow')
+        plt.title(f'Modeled Flow vs Observed Flow (NSE: {nse_test_mod:.4f})')
+        
+        plt.subplot(2, 2, 3)
+        plt.plot(y_obs_denorm[:100], label='Observed', alpha=0.7)
+        plt.plot(y_pred_denorm[:100], label='Predicted', alpha=0.7)
+        plt.xlabel('Time Steps')
+        plt.ylabel('Flow')
+        plt.title('Time Series Comparison (First 100 points)')
+
+        plt.subplot(2, 2, 4)
+        plt.plot(y_obs_denorm[:100], label='Observed', alpha=0.7)
+        plt.plot(y_mod[:100], label='Model', alpha=0.7)
+        plt.xlabel('Time Steps')
+        plt.ylabel('Flow')
+        plt.title('Time Series Comparison (First 100 points)')
+        plt.legend()
+        
+        plt.tight_layout()
+        plt.show()
+
+    return nse_test_mod, nse_test_pred
 
 
 if __name__ == "__main__":
@@ -525,7 +677,7 @@ if __name__ == "__main__":
     # Combine test data
     merged_data_test = add_normalized_obs_flow_to_meteo(extracted_data_meteo_test, extracted_data_flow_test, dataset_type='test')
 
-    # ==================================================s==========================
+    # ============================================================================
     # STEP 3: SUMMARY
     # ============================================================================
     print("\n" + "=" * 40)
@@ -551,23 +703,46 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("DATA PREPARATION COMPLETED SUCCESSFULLY!")
     print("=" * 60)
-    print("\nNext steps:")
-    print("1. Use training data for LSTM model training")
-    print("2. Use test data for model evaluation")
-    print("3. Apply normalization parameters consistently across datasets") 
     
     # ============================================================================
     # STEP 4: LSTM TRAINING
     # ============================================================================
     print("\n" + "=" * 40)
-    print(f"STEP 4: LSTM TRAINING {DATA_PERIODS[dataset_type]['description']}")
+    print(f"STEP 4: LSTM TRAINING {DATA_PERIODS['training']['description']}")
     print("=" * 40)
 
     flow_std_train = flow_std_train['OBS_RUN']
-
     flow_mean_train = flow_mean_train['OBS_RUN']
 
-    LSTM_training(merged_data_train, flow_mean_train, flow_std_train)
+    best_model = LSTM_training(merged_data_train, flow_mean_train, flow_std_train)
+
+    # ============================================================================
+    # STEP 5: LSTM TESTING
+    # ============================================================================
+    print("\n" + "=" * 40)
+    print(f"STEP 5: LSTM TESTING {DATA_PERIODS['test']['description']}")
+    print("=" * 40)
+
+    flow_std_test = flow_std_test['OBS_RUN']
+    flow_mean_test = flow_mean_test['OBS_RUN']
+
+
+    # Pass the trained model to testing function
+    nse_test_mod, nse_test_pred = LSTM_testing(
+        merged_data_test, 
+        flow_mean_test, 
+        flow_std_test, 
+        trained_model=best_model  # Pass the best model here
+    )
+
+    print(f"\nFinal Test Results:")
+    print(f"Test NSE (LSTM): {nse_test_pred:.4f}")
+    print(f"Test NSE (Physical): {nse_test_mod:.4f}")
+
+
+    
+    
+    
     
 
     
