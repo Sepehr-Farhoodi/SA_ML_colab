@@ -11,10 +11,18 @@ from torch.utils.data import Dataset, DataLoader
 import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
+import argparse
 
 # ============================================================================
 # CONFIGURATION SECTION - All hyperparameters and settings
 # ============================================================================
+
+# Watershed configuration
+WATERSHED_CONFIG = {
+    'watershed_id': '01013500',  # Change this for different watersheds
+    'HUC_number': '01',
+    'description': 'BASIN'
+}
 
 # Data periods configuration
 DATA_PERIODS = {
@@ -51,12 +59,15 @@ LSTM_CONFIG = {
     'epochs_to_plot': [1, 2, 3, 5, 10, 20, 50] # Epochs to visualize
 }
 
+# Define project root first
+PROJECT_ROOT = Path(__file__).parent
+
 # File paths configuration
 FILE_PATHS = {
-    'project_root': Path(__file__).parent,
+    'project_root': PROJECT_ROOT,
     'input_files': {
-        'meteorological': "basin_timeseries_v1p2_metForcing_obsFlow/basin_dataset_public_v1p2/basin_mean_forcing/daymet/01/01013500_lump_cida_forcing_leap.txt",
-        'flow': "model_output_daymet/model_output/flow_timeseries/daymet/01/01013500_05_model_output.txt"
+        'meteorological': PROJECT_ROOT.parent / f"basin_timeseries_v1p2_metForcing_obsFlow/basin_dataset_public_v1p2/basin_mean_forcing/daymet/{WATERSHED_CONFIG['HUC_number']}/{WATERSHED_CONFIG['watershed_id']}_lump_cida_forcing_leap.txt",
+        'flow': PROJECT_ROOT.parent / f"model_output_daymet/model_output/flow_timeseries/daymet/{WATERSHED_CONFIG['HUC_number']}/{WATERSHED_CONFIG['watershed_id']}_11_model_output.txt"
     }
 }
 
@@ -90,11 +101,6 @@ class LSTMModel(nn.Module):
         prediction = self.fc(final_hidden)
         return prediction  
 
-# ============================================================================
-# Model Initialization
-# ============================================================================
-project_path = Path(__file__).parent
-dataset_type = 'training'
 
 # ============================================================================
 # Main functions
@@ -109,8 +115,6 @@ def get_output_file_path(dataset_type):
     -----------
     dataset_type : str
         Type of dataset ('training', 'validation', 'test')
-    project_path : Path
-        Project root path
         
     Returns:
     --------
@@ -120,8 +124,9 @@ def get_output_file_path(dataset_type):
     period = DATA_PERIODS[dataset_type]
     start_year = period['start'].year
     end_year = period['end'].year
+    watershed_id = WATERSHED_CONFIG['watershed_id']
     
-    return f"{project_path}/{dataset_type}_{start_year}_{end_year}_01013500_05_forcing_flow_normalized.txt"
+    return f"{FILE_PATHS['project_root']}/{dataset_type}_{start_year}_{end_year}_{watershed_id}_05_forcing_flow_normalized.txt"
 
 # Helper function to get period dates
 def get_period_dates(dataset_type):
@@ -479,7 +484,7 @@ def LSTM_training(merged_data, flow_mean, flow_std):
                     best_model_state = model.state_dict().copy()
 
     # Save the best model
-    torch.save(best_model_state, FILE_PATHS['project_root'] / "best_model.pth")
+    torch.save(best_model_state, FILE_PATHS['project_root'] / f"{WATERSHED_CONFIG['watershed_id']}_best_model.pth")
     print(f"Best model saved with NSE: {best_nse:.4f}")
 
     # Create a fresh model with best parameters
@@ -511,7 +516,7 @@ def LSTM_testing(merged_data, flow_mean, flow_std, trained_model=None):
     if trained_model is None:
         # Fallback: load from disk if no model provided
         model = LSTMModel(input_size=5, hidden_size=20, num_layers=2, output_size=1)
-        model.load_state_dict(torch.load('best_model.pth'))
+        model.load_state_dict(torch.load(FILE_PATHS['project_root'] / f"{WATERSHED_CONFIG['watershed_id']}_best_model.pth"))        
         print("Loaded trained model from disk")
     else:
         # Use the provided trained model
@@ -636,10 +641,30 @@ def LSTM_testing(merged_data, flow_mean, flow_std, trained_model=None):
 
     return nse_test_mod, nse_test_pred
 
+def parse_arguments():
+    parser = argparse.ArgumentParser(description='LSTM Hydrological Forecasting')
+    parser.add_argument('--watershed_id', type=str, default='01013500',
+                       help='Watershed ID (default: 01013500)'),
+    parser.add_argument('--HUC_number', type=str, default='01',
+                       help='HUC number (default: 01)')
+    parser.add_argument('--config_file', type=str, default=None,
+                       help='Path to configuration file (optional)')
+    return parser.parse_args() 
+
 
 if __name__ == "__main__":
 
+    args = parse_arguments()
+
+    # Update watershed configuration
+    WATERSHED_CONFIG['watershed_id'] = args.watershed_id
+    WATERSHED_CONFIG['HUC_number'] = args.HUC_number
     
+    # Update file paths with new watershed ID
+    FILE_PATHS['input_files']['meteorological'] = PROJECT_ROOT.parent / f"basin_timeseries_v1p2_metForcing_obsFlow/basin_dataset_public_v1p2/basin_mean_forcing/daymet/{WATERSHED_CONFIG['HUC_number']}/{WATERSHED_CONFIG['watershed_id']}_lump_cida_forcing_leap.txt"
+    FILE_PATHS['input_files']['flow'] = PROJECT_ROOT.parent / f"model_output_daymet/model_output/flow_timeseries/daymet/{WATERSHED_CONFIG['HUC_number']}/{WATERSHED_CONFIG['watershed_id']}_11_model_output.txt"
+
+
     # ============================================================================
     # STEP 1: EXTRACT TRAINING DATA (1995-2014)
     # ============================================================================
@@ -683,13 +708,19 @@ if __name__ == "__main__":
     print("\n" + "=" * 40)
     print("STEP 3: WORKFLOW SUMMARY")
     print("=" * 40)
+
+    print(f"\nWatershed Configuration:")
+    print(f"- Watershed ID: {WATERSHED_CONFIG['watershed_id']}")
+    print(f"- Description: {WATERSHED_CONFIG['description']}")
     
     print(f"\nTraining dataset:")
+    print(f"- Watershed: {WATERSHED_CONFIG['watershed_id']}")  
     print(f"- Period: {DATA_PERIODS['training']['start'].date()} to {DATA_PERIODS['training']['end'].date()}")
     print(f"- Total days: {len(merged_data_train)}")
     print(f"- Output file: {get_output_file_path(dataset_type='training')}")
     
     print(f"\nTest dataset:")
+    print(f"- Watershed: {WATERSHED_CONFIG['watershed_id']}") 
     print(f"- Period: {DATA_PERIODS['test']['start'].date()} to {DATA_PERIODS['test']['end'].date()}")
     print(f"- Total days: {len(merged_data_test)}")
     print(f"- Output file: {get_output_file_path(dataset_type='test')}")
